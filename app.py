@@ -6,15 +6,11 @@ import os
 import subprocess
 import gc
 import tempfile
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image, ImageDraw, ImageColor, ImageFilter, ImageFont # AGGIUNTO ImageFont
-import io
+from matplotlib import font_manager  # usato per il font TTF bundlato (fallback cross-platform)
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from typing import Tuple, Optional, Dict, Any
 import colorsys
-import math
 import random
-import sys
 
 # ==========================================
 # GESTIONE DELLE DIPENDENZE - ORA GESTITA TRAMITE requirements.txt
@@ -42,6 +38,15 @@ FORMAT_RESOLUTIONS: Dict[str, Tuple[int, int]] = {
     "1:1": (720, 720),
     "4:3": (800, 600)
 }
+
+# Risoluzioni ridotte (480p) per l'anteprima rapida, stessa proporzione del formato scelto
+PREVIEW_RESOLUTIONS: Dict[str, Tuple[int, int]] = {
+    "16:9": (854, 480),
+    "9:16": (480, 854),
+    "1:1": (480, 480),
+    "4:3": (640, 480)
+}
+PREVIEW_DURATION_SECONDS: float = 5.0
 
 # NUOVI STILI ARTISTICI - AGGIUNTA "Barcode Visualizer"
 ARTISTIC_STYLES: Dict[str, str] = {
@@ -337,20 +342,37 @@ def create_particle_system(features: Dict[str, Any], frame_idx: int, resolution:
 
         num_particles = int(200 + effective_energy * 500 * intensity)
 
+        # Precalcola i 3 possibili colori "glow" (dipendono solo dal tema, non dalla particella)
+        colors = theme['colors']
+        glow_color_cache = {}
+        for color in set(colors) if len(colors) > 1 else {colors[0]}:
+            r, g, b = hex_to_rgb(color)
+            h, s, v = colorsys.rgb_to_hsv(r / 255., g / 255., b / 255.)
+            v_glow = min(1.0, v * 1.5)
+            s_glow = min(1.0, s * 0.8)
+            r_glow, g_glow, b_glow = colorsys.hsv_to_rgb(h, s_glow, v_glow)
+            glow_color_cache[color] = (int(r_glow * 255), int(g_glow * 255), int(b_glow * 255))
+
+        # Layer separato per il glow: un cerchio piatto per particella + UNA sola sfocatura
+        # invece di 6-7 ellissi concentriche per particella (era il vero collo di bottiglia).
+        glow_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_layer)
+
+        center_x, center_y = width // 2, height // 2
+        core_particles = []  # (x, y, particle_size, color, alpha) per il core nitido finale
+
         for i in range(num_particles):
             angle = (i / num_particles) * 2 * np.pi + frame_idx * 0.08 * intensity
             base_radius = min(width, height) * 0.15
             radius_variation = (bass_energy * 0.5 + mid_energy * 0.3 + high_energy * 0.2) * min(width, height) * 0.4
             radius = base_radius + radius_variation * (1 + np.sin(angle * 5 + frame_idx * 0.15))
 
-            center_x, center_y = width // 2, height // 2
             x = int(center_x + radius * np.cos(angle) * (1 + effective_energy * 0.2))
             y = int(center_y + radius * np.sin(angle) * (1 + effective_energy * 0.2))
 
             particle_size = int(4 + onset_strength * 25 + effective_energy * 15 * intensity)
             particle_size = max(1, particle_size)
 
-            colors = theme['colors']
             if len(colors) == 1:
                 color = colors[0]
             else:
@@ -360,27 +382,27 @@ def create_particle_system(features: Dict[str, Any], frame_idx: int, resolution:
                     color = colors[1 % len(colors)]
                 else:
                     color = colors[2 % len(colors)]
-            
+
             alpha = int(150 + effective_energy * 105)
+            glow_radius = particle_size + 6
+            glow_rgb = glow_color_cache[color]
 
-            for glow_radius in range(particle_size + 6, particle_size - 1, -1):
-                glow_alpha = max(10, alpha // (glow_radius - particle_size + 2))
-                if glow_radius > particle_size:
-                    r, g, b = hex_to_rgb(color)
-                    h, s, v = colorsys.rgb_to_hsv(r / 255., g / 255., b / 255.)
-                    v_glow = min(1.0, v * 1.5)
-                    s_glow = min(1.0, s * 0.8)
-                    r_glow, g_glow, b_glow = colorsys.hsv_to_rgb(h, s_glow, v_glow)
-                    r_glow_int = int(r_glow * 255)
-                    g_glow_int = int(g_glow * 255)
-                    b_glow_int = int(b_glow * 255)
-                    final_glow_color = (r_glow_int, g_glow_int, b_glow_int, glow_alpha)
-                else:
-                    final_glow_color = (*hex_to_rgb(color), alpha)
+            glow_draw.ellipse([x - glow_radius, y - glow_radius,
+                                x + glow_radius, y + glow_radius],
+                               fill=(*glow_rgb, alpha))
+            core_particles.append((x, y, particle_size, color, alpha))
 
-                draw.ellipse([x - glow_radius, y - glow_radius,
-                            x + glow_radius, y + glow_radius], fill=final_glow_color)
-    
+        # Una sola sfocatura gaussiana per l'intero frame (non una per particella)
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=4))
+        img = Image.alpha_composite(img, glow_layer)
+        draw = ImageDraw.Draw(img)
+
+        # Core nitido sopra il glow sfocato
+        for x, y, particle_size, color, alpha in core_particles:
+            draw.ellipse([x - particle_size, y - particle_size,
+                          x + particle_size, y + particle_size],
+                         fill=(*hex_to_rgb(color), alpha))
+
     draw_text_on_frame(draw, resolution, custom_text, text_font, text_color, text_position) # DISEGNA TESTO
     return img.convert('RGB')
 
@@ -668,24 +690,36 @@ def create_neural_network(features: Dict[str, Any], frame_idx: int, resolution: 
 
                 nodes.append((x, y, activation))
 
-        for i, (x1, y1, act1) in enumerate(nodes):
-            for j, (x2, y2, act2) in enumerate(nodes[i+1:], i+1):
-                distance = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        # Distanze e forza di connessione calcolate in blocco con NumPy (broadcasting)
+        # invece di un doppio ciclo Python con sqrt per ognuna delle 2016 coppie/frame.
+        xs = np.array([n[0] for n in nodes], dtype=np.float64)
+        ys = np.array([n[1] for n in nodes], dtype=np.float64)
+        acts = np.array([n[2] for n in nodes], dtype=np.float64)
 
-                if distance < min(width, height) * 0.2:
-                    connection_strength = (act1 + act2) / 2 * intensity
+        dx = xs[:, None] - xs[None, :]
+        dy = ys[:, None] - ys[None, :]
+        dist_matrix = np.sqrt(dx**2 + dy**2)
+        strength_matrix = (acts[:, None] + acts[None, :]) / 2 * intensity
 
-                    if connection_strength > 0.3:
-                        line_width = max(1, int(connection_strength * 3))
+        distance_threshold = min(width, height) * 0.2
+        pair_mask = np.triu(
+            (dist_matrix < distance_threshold) & (strength_matrix > 0.3),
+            k=1
+        )
+        pair_i, pair_j = np.where(pair_mask)
 
-                        if connection_strength < 0.5:
-                            color = theme['colors'][0]
-                        elif connection_strength < 0.75:
-                            color = theme['colors'][1 % len(theme['colors'])]
-                        else:
-                            color = theme['colors'][2 % len(theme['colors'])]
+        for i, j in zip(pair_i, pair_j):
+            connection_strength = strength_matrix[i, j]
+            line_width = max(1, int(connection_strength * 3))
 
-                        draw.line([x1, y1, x2, y2], fill=color, width=line_width)
+            if connection_strength < 0.5:
+                color = theme['colors'][0]
+            elif connection_strength < 0.75:
+                color = theme['colors'][1 % len(theme['colors'])]
+            else:
+                color = theme['colors'][2 % len(theme['colors'])]
+
+            draw.line([xs[i], ys[i], xs[j], ys[j]], fill=color, width=line_width)
 
         for x, y, activation in nodes:
             if activation > 0.2:
@@ -805,6 +839,29 @@ def create_lightning_storm(features: Dict[str, Any], frame_idx: int, resolution:
 
             segments = 8 + int(effective_energy * 12)
 
+            # Il colore e la sua variante "glow" dipendono solo dal fulmine (lightning % 3),
+            # non dal segmento: calcolarli una sola volta per fulmine invece che ad ogni segmento
+            # elimina fino a 19 conversioni HSV ridondanti per fulmine.
+            # NOTA: qui il pattern "layer separato + blur unico" (usato per Particle System)
+            # è stato provato e scartato: con poche decine di linee per frame il costo fisso
+            # della GaussianBlur su tutto il frame supera il risparmio (misurato ~6x più lento).
+            # Il blur conviene solo quando le forme da fondere sono centinaia/migliaia.
+            if lightning % 3 == 0:
+                color = theme['colors'][0]
+            elif lightning % 3 == 1:
+                color = theme['colors'][1 % len(theme['colors'])]
+            else:
+                color = theme['colors'][2 % len(theme['colors'])]
+
+            r, g, b = hex_to_rgb(color)
+            h, s, v = colorsys.rgb_to_hsv(r / 255., g / 255., b / 255.)
+            v_glow = min(1.0, v * 1.5)
+            s_glow = min(1.0, s * 0.5)
+            r_glow, g_glow, b_glow = colorsys.hsv_to_rgb(h, s_glow, v_glow)
+            glow_rgb = (int(r_glow * 255), int(g_glow * 255), int(b_glow * 255))
+
+            line_width = max(1, int(1 + effective_energy * 4))
+
             for segment in range(segments):
                 progress = (segment + 1) / segments
 
@@ -816,36 +873,16 @@ def create_lightning_storm(features: Dict[str, Any], frame_idx: int, resolution:
                 next_x = int(target_x + offset_x)
                 next_y = int(target_y + offset_y)
 
-                if lightning % 3 == 0:
-                    color = theme['colors'][0]
-                elif lightning % 3 == 1:
-                    color = theme['colors'][1 % len(theme['colors'])]
-                else:
-                    color = theme['colors'][2 % len(theme['colors'])]
-
-                line_width = max(1, int(1 + effective_energy * 4))
-
                 draw.line([current_x, current_y, next_x, next_y], fill=color, width=line_width)
 
                 for glow in range(1, 4):
                     glow_width = line_width + glow
-                    r, g, b = hex_to_rgb(color)
                     glow_alpha = max(50, 200 // glow)
-                    
-                    h, s, v = colorsys.rgb_to_hsv(r / 255., g / 255., b / 255.)
-                    v_glow = min(1.0, v * 1.5)
-                    s_glow = min(1.0, s * 0.5)
-                    r_glow, g_glow, b_glow = colorsys.hsv_to_rgb(h, s_glow, v_glow)
-                    
-                    simulated_r = int(r_glow * 255)
-                    simulated_g = int(g_glow * 255)
-                    simulated_b = int(b_glow * 255)
-                    final_glow_color = (simulated_r, simulated_g, simulated_b, glow_alpha)
-                    
-                    draw.line([current_x, current_y, next_x, next_y], fill=final_glow_color, width=glow_width)
+                    draw.line([current_x, current_y, next_x, next_y],
+                              fill=(*glow_rgb, glow_alpha), width=glow_width)
 
                 current_x, current_y = next_x, next_y
-    
+
     draw_text_on_frame(draw, resolution, custom_text, text_font, text_color, text_position) # DISEGNA TESTO
     return img.convert('RGB')
 
@@ -936,6 +973,26 @@ def create_barcode_visualizer(features: Dict[str, Any], frame_idx: int, resoluti
     return img.convert('RGB')
 
 
+@st.cache_resource
+def load_scalable_font(font_size: int) -> Any:
+    """Carica un font TTF scalabile. Su Streamlit Cloud 'arial.ttf' non esiste quasi mai,
+    quindi si usa come fallback garantito il DejaVu Sans bundlato con matplotlib
+    (dipendenza già presente in requirements.txt su ogni piattaforma)."""
+    local_font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arial.ttf")
+    try:
+        if os.path.exists(local_font_path):
+            return ImageFont.truetype(local_font_path, font_size)
+    except Exception:
+        pass
+
+    try:
+        bundled_font_path = font_manager.findfont("DejaVu Sans")
+        return ImageFont.truetype(bundled_font_path, font_size)
+    except Exception:
+        # Ultima spiaggia: font di default (non scalabile, ma non farà mai crashare l'app)
+        st.warning("Nessun font TTF scalabile disponibile. Uso il font predefinito PIL.")
+        return ImageFont.load_default()
+
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     """Converte colore hex in RGB."""
     hex_color = hex_color.lstrip('#')
@@ -944,11 +1001,15 @@ def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
 def generate_artistic_visualization(features: Dict[str, Any], style: str, resolution: Tuple[int, int],
                                   theme: Dict[str, Any], fps: int, intensity: float, global_volume_offset: float,
                                   output_dir: str, background_image: Optional[Image.Image], # AGGIUNTO
-                                  custom_text: str, text_font: Any, text_color: str, text_position: str) -> int: # AGGIUNTI
-    """Genera visualizzazione artistica salvando direttamente su disco."""
+                                  custom_text: str, text_font: Any, text_color: str, text_position: str, # AGGIUNTI
+                                  max_frames: Optional[int] = None) -> int:
+    """Genera visualizzazione artistica salvando direttamente su disco.
+    Se max_frames è fornito, limita il rendering ai primi N frame (usato per l'anteprima rapida)."""
     duration = features['duration']
     total_frames = int(duration * fps)
-    actual_frames = min(total_frames, MAX_DURATION * fps)
+    actual_frames = min(total_frames, int(MAX_DURATION * fps))
+    if max_frames is not None:
+        actual_frames = min(actual_frames, max_frames)
 
     # Mappatura stili a funzioni
     style_functions = {
@@ -965,7 +1026,8 @@ def generate_artistic_visualization(features: Dict[str, Any], style: str, resolu
 
     style_func = style_functions.get(style, create_particle_system)
     progress_bar = st.progress(0)
-    
+
+    frame_idx = -1  # garantisce che 'return frame_idx + 1' non sollevi NameError se actual_frames == 0
     for frame_idx in range(actual_frames):
         try:
             # Passa i nuovi parametri a tutte le funzioni di stile
@@ -988,6 +1050,21 @@ def generate_artistic_visualization(features: Dict[str, Any], style: str, resolu
             break
             
     return frame_idx + 1
+
+def trim_audio_ffmpeg(audio_path: str, output_path: str, duration_seconds: float) -> bool:
+    """Ritaglia i primi N secondi dell'audio per il mux dell'anteprima rapida."""
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', audio_path,
+            '-t', str(duration_seconds),
+            '-c:a', 'aac',
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        return result.returncode == 0 and os.path.exists(output_path)
+    except Exception:
+        return False
 
 def create_video_ffmpeg_pipe(fps: int, output_path: str, audio_path: str, frame_dir: str, frame_count: int) -> bool:
     """Crea video usando FFmpeg con input da pipe (zero-copy)"""
@@ -1100,15 +1177,7 @@ def main():
             ["Top-Left", "Top-Center", "Top-Right", "Bottom-Left", "Bottom-Center", "Bottom-Right", "Center"]
         )
         
-        text_font = ImageFont.load_default() # Inizializza con font predefinito
-        font_path = "arial.ttf" # Nome del file del font, assicurati che sia nella stessa directory
-        try:
-            if os.path.exists(font_path):
-                text_font = ImageFont.truetype(font_path, text_font_size)
-            else:
-                st.warning("Font 'arial.ttf' non trovato. Utilizzo font predefinito.")
-        except Exception as e:
-            st.warning(f"Errore caricamento font: {e}. Utilizzo font predefinito.")
+        text_font = load_scalable_font(text_font_size)
 
 
         format_ratio = st.selectbox(
@@ -1214,7 +1283,50 @@ def main():
                 **Frames totali:** ~{int(duration * fps)}
                 """)
 
-            if st.button("🚀 Genera Visualizzazione Artistica", type="primary"):
+            preview_col, full_col = st.columns(2)
+
+            with preview_col:
+                if st.button("🔍 Anteprima Rapida (480p, 5s)"):
+                    intensity_value = MOVEMENT_INTENSITY[movement_intensity]
+                    preview_resolution = PREVIEW_RESOLUTIONS[format_ratio]
+                    preview_seconds = min(PREVIEW_DURATION_SECONDS, duration)
+                    preview_frames = max(1, int(preview_seconds * fps))
+
+                    with tempfile.TemporaryDirectory() as preview_frame_dir:
+                        with st.spinner("🔍 Generando anteprima 480p..."):
+                            preview_frame_count = generate_artistic_visualization(
+                                features, selected_style, preview_resolution, selected_theme_data, fps,
+                                intensity_value, global_volume_offset, preview_frame_dir, background_image,
+                                custom_text, text_font, text_color, text_position,
+                                max_frames=preview_frames
+                            )
+
+                        if preview_frame_count > 0:
+                            preview_output_path = "soundwave_preview_480p.mp4"
+                            preview_audio_path = temp_audio_path + "_preview.aac"
+
+                            with st.spinner("🎬 Assemblando anteprima..."):
+                                audio_trimmed = trim_audio_ffmpeg(temp_audio_path, preview_audio_path, preview_seconds)
+                                mux_audio_path = preview_audio_path if audio_trimmed else temp_audio_path
+                                preview_success = create_video_ffmpeg_pipe(
+                                    fps, preview_output_path, mux_audio_path, preview_frame_dir, preview_frame_count
+                                )
+
+                            if preview_success and os.path.exists(preview_output_path):
+                                st.success(f"✅ Anteprima pronta ({preview_resolution[0]}x{preview_resolution[1]}, {preview_seconds:.0f}s)")
+                                st.video(preview_output_path)
+                            else:
+                                st.error("❌ Errore nella creazione dell'anteprima.")
+
+                            if os.path.exists(preview_audio_path):
+                                os.unlink(preview_audio_path)
+                        else:
+                            st.error("❌ Nessun frame generato per l'anteprima.")
+
+            with full_col:
+                run_full_render = st.button("🚀 Genera Visualizzazione Artistica", type="primary")
+
+            if run_full_render:
                 intensity_value = MOVEMENT_INTENSITY[movement_intensity]
                 resolution = FORMAT_RESOLUTIONS[format_ratio]
                 
